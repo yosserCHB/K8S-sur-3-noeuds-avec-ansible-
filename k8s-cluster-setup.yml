@@ -1,0 +1,161 @@
+---
+- name: Kubernetes Cluster Setup
+  hosts: k8s_nodes
+  become: yes
+  tasks:
+
+    # Étape 1 : Désactiver le swap
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Comment out swap in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^.*swap.*'
+        line: '#&'
+
+    # Étape 2 : Charger les modules du noyau nécessaires
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    # Étape 3 : Configurer les paramètres sysctl
+    - name: Set sysctl parameters
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { key: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { key: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { key: "net.ipv4.ip_forward", value: "1" }
+
+    # Étape 4 : Nettoyer les configurations existantes de Kubernetes
+    - name: Clean up existing Kubernetes repository configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - /usr/share/keyrings/kubernetes-archive-keyring.gpg
+
+    # Étape 5 : Ajouter la clé APT Kubernetes
+    - name: Add Kubernetes APT key
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        keyring: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+        state: present
+
+    # Étape 6 : Ajouter le dépôt APT Kubernetes
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: 'deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /'
+        state: present
+        filename: kubernetes.list
+
+    # Étape 7 : Mettre à jour le cache APT et installer les composants Kubernetes et Docker
+    - name: Install Kubernetes components and Docker
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+        allow_downgrades: yes
+      loop:
+        - kubelet=1.29.3-1.1
+        - kubeadm=1.29.3-1.1
+        - kubectl=1.29.3-1.1
+        - docker.io
+
+    # Étape 8 : Configurer containerd
+    - name: Configure containerd
+      block:
+        - name: Create containerd config directory
+          file:
+            path: /etc/containerd
+            state: directory
+
+        - name: Create default containerd config
+          command: containerd config default > /etc/containerd/config.toml
+          args:
+            creates: /etc/containerd/config.toml
+
+        - name: Modify containerd config to use systemd cgroup
+          lineinfile:
+            path: /etc/containerd/config.toml
+            regexp: '^SystemdCgroup = false'
+            line: 'SystemdCgroup = true'
+            state: present
+
+    # Étape 9 : Redémarrer et activer les services
+    - name: Restart containerd service
+      systemd:
+        name: containerd
+        state: restarted
+
+    - name: Restart kubelet service
+      systemd:
+        name: kubelet
+        state: restarted
+
+    - name: Enable kubelet service to start on boot
+      systemd:
+        name: kubelet
+        enabled: yes
+
+    # Étape 10 : Initialiser le plan de contrôle Kubernetes (sur le nœud master)
+    - name: Initialize Kubernetes control plane
+      command: kubeadm init --pod-network-cidr=10.10.0.0/16
+      when: inventory_hostname == 'master-node'
+
+    # Étape 11 : Configurer kubeconfig pour kubectl
+    - name: Configure kubeconfig for kubectl
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      when: inventory_hostname == 'master-node'
+
+    # Étape 12 : Installer le plugin réseau Calico
+    - name: Install Calico network plugin
+      kubernetes.core.k8s:
+        state: present
+        src: https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: inventory_hostname == 'master-node'
+
+    # Étape 13 : Télécharger et appliquer les ressources personnalisées de Calico
+    - name: Download Calico custom resources
+      get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
+        dest: /tmp/custom-resources.yaml
+      when: inventory_hostname == 'master-node'
+
+    - name: Modify custom-resources.yaml
+      replace:
+        path: /tmp/custom-resources.yaml
+        regexp: 'cidr: 192\.168\.0\.0/16'
+        replace: 'cidr: 10.10.0.0/16'
+      when: inventory_hostname == 'master-node'
+
+    - name: Apply modified Calico resources
+      kubernetes.core.k8s:
+        state: present
+        src: /tmp/custom-resources.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: inventory_hostname == 'master-node'
+
+    # Étape 14 : Message de fin
+    - name: Print Kubernetes setup complete message
+      debug:
+        msg: "Kubernetes setup is complete!"
